@@ -186,6 +186,8 @@ def train():
             near = 0.
             far = 1.
         print('NEAR FAR', near, far)
+
+        args.num_dyn = 2  # number of dynamic objects from reading the data segmentation
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
@@ -380,12 +382,12 @@ def train():
 
                 global_step += 1
 
-        # Save the pretrained weight
-        torch.save({
-            'global_step': global_step,
-            'network_fn_s_state_dict': render_kwargs_train['network_fn_s'].state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-        }, os.path.join(basedir, expname, 'Pretrained_S.tar'))
+        # # Save the pretrained weight
+        # torch.save({
+        #     'global_step': global_step,
+        #     'network_fn_s_state_dict': render_kwargs_train['network_fn_s'].state_dict(),
+        #     'optimizer_state_dict': optimizer.state_dict(),
+        # }, os.path.join(basedir, expname, 'Pretrained_S.tar'))
 
         # Reset
         render_kwargs_train.update({'pretrain': False})
@@ -421,14 +423,17 @@ def train():
 
         rays_o, rays_d = get_rays(H, W, focal, torch.Tensor(pose)) # (H, W, 3), (H, W, 3)
         coords_d = torch.stack((torch.where(mask < 0.5)), -1)
+        coords_d1 = coords_d[:len(coords_d)//2]
+        coords_d2 = coords_d[len(coords_d)//2:]
         coords_s = torch.stack((torch.where(mask >= 0.5)), -1)
         coords = torch.stack((torch.where(mask > -1)), -1)
 
         # Evenly sample dynamic region and static region
-        select_inds_d = np.random.choice(coords_d.shape[0], size=[min(len(coords_d), N_rand//2)], replace=False)
+        select_inds_d1 = np.random.choice(coords_d.shape[0], size=[min(len(coords_d1), N_rand//2)], replace=False)
+        select_inds_d2 = np.random.choice(coords_d.shape[0], size=[min(len(coords_d2), N_rand//2)], replace=False)
         select_inds_s = np.random.choice(coords_s.shape[0], size=[N_rand//2], replace=False)
         select_coords = torch.cat([coords_s[select_inds_s],
-                                   coords_d[select_inds_d]], 0)
+                                   coords_d1[select_inds_d1], coords_d2[select_inds_d2]], 0)
 
         def select_batch(value, select_coords=select_coords):
             return value[select_coords[:, 0], select_coords[:, 1]]

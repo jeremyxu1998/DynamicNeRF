@@ -320,8 +320,9 @@ def render_path(render_poses,
 
 
 def raw2outputs(raw_s,
-                raw_d,
-                blending,
+                raws_d,
+                blending_s,
+                blendings_d,
                 z_vals,
                 rays_d,
                 raw_noise_std):
@@ -358,41 +359,50 @@ def raw2outputs(raw_s,
     dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
 
     # Extract RGB of each sample position along each ray.
-    rgb_d = torch.sigmoid(raw_d[..., :3])  # [N_rays, N_samples, 3]
+    rgbs_d = [torch.sigmoid(raw_d[..., :3]) for raw_d in raws_d]  # [N_dyn, N_rays, N_samples, 3]
     rgb_s = torch.sigmoid(raw_s[..., :3])  # [N_rays, N_samples, 3]
 
     # Add noise to model's predictions for density. Can be used to
     # regularize network during training (prevents floater artifacts).
     noise = 0.
     if raw_noise_std > 0.:
-        noise = torch.randn(raw_d[..., 3].shape) * raw_noise_std
+        noise = torch.randn(raws_d[0][..., 3].shape) * raw_noise_std
 
     # Predict density of each sample along each ray. Higher values imply
     # higher likelihood of being absorbed at this point.
-    alpha_d = raw2alpha(raw_d[..., 3] + noise, dists) # [N_rays, N_samples]
+    alphas_d = [raw2alpha(raw_d[..., 3] + noise, dists) for raw_d in raws_d]  # [N_dyn, N_rays, N_samples]
     alpha_s = raw2alpha(raw_s[..., 3] + noise, dists) # [N_rays, N_samples]
-    alphas  = 1. - (1. - alpha_s) * (1. - alpha_d) # [N_rays, N_samples]
+    # alphas  = 1. - (1. - alpha_s) * (1. - alpha_d) # [N_rays, N_samples]
 
-    T_d    = torch.cumprod(torch.cat([torch.ones((alpha_d.shape[0], 1)), 1. - alpha_d + 1e-10], -1), -1)[:, :-1]
+    Ts_d   = [torch.cumprod(torch.cat([torch.ones((alpha_d.shape[0], 1)), 1. - alpha_d + 1e-10], -1), -1)[:, :-1] for alpha_d in alphas_d]
     T_s    = torch.cumprod(torch.cat([torch.ones((alpha_s.shape[0], 1)), 1. - alpha_s + 1e-10], -1), -1)[:, :-1]
-    T_full = torch.cumprod(torch.cat([torch.ones((alpha_d.shape[0], 1)), (1. - alpha_d * blending) * (1. - alpha_s * (1. - blending)) + 1e-10], -1), -1)[:, :-1]
+    T_alpha_blend = 1. - alpha_s * blending_s
+    for alpha_d, blending_d in zip(alphas_d, blendings_d):
+        T_alpha_blend *= (1. - alpha_d * blending_d)
+    T_full = torch.cumprod(torch.cat([torch.ones((alphas_d[0].shape[0], 1)), T_alpha_blend + 1e-10], -1), -1)[:, :-1]
     # T_full = torch.cumprod(torch.cat([torch.ones((alpha_d.shape[0], 1)), torch.pow(1. - alpha_d + 1e-10, blending) * torch.pow(1. - alpha_s + 1e-10, 1. - blending)], -1), -1)[:, :-1]
     # T_full = torch.cumprod(torch.cat([torch.ones((alpha_d.shape[0], 1)), (1. - alpha_d) * (1. - alpha_s) + 1e-10], -1), -1)[:, :-1]
 
     # Compute weight for RGB of each sample along each ray.  A cumprod() is
     # used to express the idea of the ray not having reflected up to this
     # sample yet.
-    weights_d = alpha_d * T_d
+    weightss_d = [alpha_d * T_d for alpha_d, T_d in zip(alphas_d, Ts_d)]
     weights_s = alpha_s * T_s
-    weights_full = (alpha_d * blending + alpha_s * (1. - blending)) * T_full
+    weights_full = alpha_s * blending_s
+    for alpha_d, blending_d in zip(alphas_d, blendings_d):
+        weights_full += alpha_d * blending_d
+    weights_full *= T_full
     # weights_full = alphas * T_full
 
     # Computed weighted color of each sample along each ray.
-    rgb_map_d = torch.sum(weights_d[..., None] * rgb_d, -2)
+    rgb_map_d = torch.zeros((len(rgbs_d), rgbs_d[0].shape[0], 3))
+    for weights_d, rgb_d in zip(weightss_d, rgbs_d):
+        rgb_map_d += torch.sum(weights_d[..., None] * rgb_d, -2)
     rgb_map_s = torch.sum(weights_s[..., None] * rgb_s, -2)
-    rgb_map_full = torch.sum(
-        (T_full * alpha_d * blending)[..., None] * rgb_d + \
-        (T_full * alpha_s * (1. - blending))[..., None] * rgb_s, -2)
+    rgb_map_full = (T_full * alpha_s * blending_s)[..., None] * rgb_s
+    for alpha_d, blending_d in zip(alphas_d, blendings_d):
+        rgb_map_full += (T_full * alpha_d * blending_d)[..., None] * rgb_d
+    rgb_map_full = torch.sum(rgb_map_full, -2)
 
     # Estimated depth map is expected distance.
     depth_map_d = torch.sum(weights_d * z_vals, -1)
@@ -405,7 +415,10 @@ def raw2outputs(raw_s,
     acc_map_full = torch.sum(weights_full, -1)
 
     # Computed dynamicness
-    dynamicness_map = torch.sum(weights_full * blending, -1)
+    blending_d_combined = torch.zeros_like(blendings_d[0])
+    for blending_d in blendings_d:
+        blending_d_combined += blending_d
+    dynamicness_map = torch.sum(weights_full * blending_d_combined, -1)
     # dynamicness_map = 1 - T_d[..., -1]
 
     return rgb_map_full, depth_map_full, acc_map_full, weights_full, \
@@ -463,7 +476,7 @@ def raw2outputs_d(raw_d,
 def render_rays(t,
                 chain_5frames,
                 ray_batch,
-                network_fn_d,
+                network_fns_d,
                 network_fn_s,
                 network_query_fn_d,
                 network_query_fn_s,
@@ -561,15 +574,6 @@ def render_rays(t,
     # raw_s_a:        [N_rays, N_samples, 3:4]
     # raw_s_blending: [N_rays, N_samples, 4:5]
 
-    # Second pass: we have the DyanmicNeRF results and the blending weight
-    raw_d = network_query_fn_d(pts_ref, viewdirs, network_fn_d)
-    # raw_d:          [N_rays, N_samples, 11]
-    # raw_d_rgb:      [N_rays, N_samples, 0:3]
-    # raw_d_a:        [N_rays, N_samples, 3:4]
-    # sceneflow_b:    [N_rays, N_samples, 4:7]
-    # sceneflow_f:    [N_rays, N_samples, 7:10]
-    # raw_d_blending: [N_rays, N_samples, 10:11]
-
     if pretrain:
         rgb_map_s, _ = raw2outputs_d(raw_s[..., :4],
                                      z_vals,
@@ -579,16 +583,29 @@ def render_rays(t,
         return ret
 
     raw_s_rgba = raw_s[..., :4]
-    raw_d_rgba = raw_d[..., :4]
+    # if not DyNeRF_blending:
+    blending_s = raw_s[..., 4]
 
-    # We need the sceneflow from the dynamicNeRF.
-    sceneflow_b = raw_d[..., 4:7]
-    sceneflow_f = raw_d[..., 7:10]
+    # Second pass: we have the DyanmicNeRF results and the blending weight
+    raws_d, raws_d_rgba, sceneflows_b, sceneflows_f, blendings_d = [], [], [], [], []
+    for network_fn_d in network_fns_d:
+        raw_d = network_query_fn_d(pts_ref, viewdirs, network_fn_d)
+        # raw_d:          [N_rays, N_samples, 11]
+        # raw_d_rgb:      [N_rays, N_samples, 0:3]
+        # raw_d_a:        [N_rays, N_samples, 3:4]
+        # sceneflow_b:    [N_rays, N_samples, 4:7]
+        # sceneflow_f:    [N_rays, N_samples, 7:10]
+        # raw_d_blending: [N_rays, N_samples, 10:11]
 
-    if DyNeRF_blending:
-        blending = raw_d[..., 10]
-    else:
-        blending = raw_s[..., 4]
+        raws_d.append(raw_d)
+        raws_d_rgba.append(raw_d[..., :4])
+
+        # We need the sceneflow from the dynamicNeRF.
+        sceneflows_b.append(raw_d[..., 4:7])
+        sceneflows_f.append(raw_d[..., 7:10])    
+
+        if DyNeRF_blending:
+            blendings_d.append(raw_d[..., 10])
 
     # if sfmask:
     #     sceneflow_f = sceneflow_f * blending.detach()[..., None]
@@ -599,8 +616,9 @@ def render_rays(t,
     rgb_map_s, depth_map_s, acc_map_s, weights_s, \
     rgb_map_d, depth_map_d, acc_map_d, weights_d, \
     dynamicness_map = raw2outputs(raw_s_rgba,
-                                  raw_d_rgba,
-                                  blending,
+                                  raws_d_rgba,
+                                  blending_s,
+                                  blendings_d,
                                   z_vals,
                                   rays_d,
                                   raw_noise_std)

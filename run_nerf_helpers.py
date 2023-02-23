@@ -263,14 +263,18 @@ def create_nerf(args):
         # L * (sin, cos) * (3 Cartesian viewing direction unit vector from [theta, phi]) + (3 Cartesian viewing direction unit vector from [theta, phi])
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
-    model_d = NeRF_d(D=args.netdepth, W=args.netwidth,
-                     input_ch=input_ch_d, output_ch=output_ch, skips=skips,
-                     input_ch_views=input_ch_views,
-                     use_viewdirsDyn=args.use_viewdirsDyn).to(device)
-
     device_ids = list(range(torch.cuda.device_count()))
-    model_d = torch.nn.DataParallel(model_d, device_ids=device_ids)
-    grad_vars = list(model_d.parameters())
+    grad_vars = []
+    models_d = []
+    for _ in range(args.num_dyn):
+        model_d = NeRF_d(D=args.netdepth, W=args.netwidth,
+                        input_ch=input_ch_d, output_ch=output_ch, skips=skips,
+                        input_ch_views=input_ch_views,
+                        use_viewdirsDyn=args.use_viewdirsDyn).to(device)
+    
+        model_d = torch.nn.DataParallel(model_d, device_ids=device_ids)
+        grad_vars += list(model_d.parameters())
+        models_d.append(model_d)
 
     embed_fn_s, input_ch_s = get_embedder(args.multires, args.i_embed, 3)
     # 10 * 2 * 3 + 3 = 63
@@ -301,9 +305,9 @@ def create_nerf(args):
         netchunk=args.netchunk)
 
     render_kwargs_train = {
-        'network_query_fn_d': network_query_fn_d,
+        'network_query_fn_d': network_query_fn_d,  # different dynamic models can still use the same query function
         'network_query_fn_s': network_query_fn_s,
-        'network_fn_d': model_d,
+        'network_fns_d': models_d,
         'network_fn_s': model_s,
         'perturb': args.perturb,
         'N_importance': args.N_importance,
@@ -347,7 +351,7 @@ def create_nerf(args):
 
         start = ckpt['global_step'] + 1
         # optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        model_d.load_state_dict(ckpt['network_fn_d_state_dict'])
+        model_d.load_state_dict(ckpt['network_fn_d_state_dict'])  # TODO
         model_s.load_state_dict(ckpt['network_fn_s_state_dict'])
         print('Resetting step to', start)
 

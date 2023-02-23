@@ -34,3 +34,6 @@ mask_loss_lambda = 0.1
 sparse_loss_lambda = 0.001
 DyNeRF_blending = True
 pretrain = True
+
+ft_path_S = ./logs/Playground_H270_DyNeRF_pretrain/Pretrained_S.tar
+no_reload = True
