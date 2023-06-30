@@ -179,7 +179,7 @@ def train():
 
         print('DEFINING BOUNDS')
         if args.no_ndc:
-            raise NotImplementedError
+            # raise NotImplementedError
             near = np.ndarray.min(bds) * .9
             far = np.ndarray.max(bds) * 1.
         else:
@@ -292,7 +292,8 @@ def train():
         # Pre-train StaticNeRF first and use DynamicNeRF to blend
         assert args.DyNeRF_blending == True
 
-        if args.ft_path_S is not None and args.ft_path_S != 'None':
+        # if args.ft_path_S is not None and args.ft_path_S != 'None':
+        if False:
             # Load Pre-trained StaticNeRF
             ckpt_path = args.ft_path_S
             print('Reloading StaticNeRF from', ckpt_path)
@@ -300,6 +301,11 @@ def train():
             render_kwargs_train['network_fn_s'].load_state_dict(ckpt['network_fn_s_state_dict'])
         else:
             # Train StaticNeRF from scratch
+            print("Train StaticNeRF from scratch")
+            # ckpt_path = args.ft_path_S
+            # print('Reloading StaticNeRF from', ckpt_path)
+            # ckpt = torch.load(ckpt_path)
+            # render_kwargs_train['network_fn_s'].load_state_dict(ckpt['network_fn_s_state_dict'])
             for i in range(args.N_iters):
                 time0 = time.time()
 
@@ -311,6 +317,10 @@ def train():
                 mask = masks[img_i] # Static region mask
 
                 rays_o, rays_d = get_rays(H, W, focal, torch.Tensor(pose)) # (H, W, 3), (H, W, 3)
+                print("far cam: ", torch.max(torch.norm(rays_o, dim=-1)))
+                print("near cam: ", torch.min(torch.norm(rays_o, dim=-1)))
+                print("long cam ray: ", torch.max(torch.norm(rays_d, dim=-1)))
+                print("short cam ray: ", torch.min(torch.norm(rays_d, dim=-1)))
                 coords_s = torch.stack((torch.where(mask >= 0.5)), -1)
                 select_inds_s = np.random.choice(coords_s.shape[0], size=[N_rand], replace=False)
                 select_coords = coords_s[select_inds_s]
@@ -331,6 +341,8 @@ def train():
                              chunk=args.chunk,
                              rays=batch_rays,
                              **render_kwargs_train)
+
+                # breakpoint()
 
                 optimizer.zero_grad()
 

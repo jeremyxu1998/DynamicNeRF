@@ -272,7 +272,7 @@ def create_nerf(args):
     model_d = torch.nn.DataParallel(model_d, device_ids=device_ids)
     grad_vars = list(model_d.parameters())
 
-    embed_fn_s, input_ch_s = get_embedder(args.multires, args.i_embed, 3)
+    embed_fn_s, input_ch_s = get_embedder(args.multires, args.i_embed, 4)
     # 10 * 2 * 3 + 3 = 63
     # L * (sin, cos) * (x, y, z) + (x, y, z)
 
@@ -347,7 +347,7 @@ def create_nerf(args):
 
         start = ckpt['global_step'] + 1
         # optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        model_d.load_state_dict(ckpt['network_fn_d_state_dict'])
+        # model_d.load_state_dict(ckpt['network_fn_d_state_dict'])
         model_s.load_state_dict(ckpt['network_fn_s_state_dict'])
         print('Resetting step to', start)
 

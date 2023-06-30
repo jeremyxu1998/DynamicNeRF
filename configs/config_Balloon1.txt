@@ -1,4 +1,4 @@
-expname = Balloon1_H270_DyNeRF_pretrain
+expname = Balloon_mix_H270_DyNeRF_pretrain
 basedir = ./logs
 datadir = ./data/Balloon1/
 

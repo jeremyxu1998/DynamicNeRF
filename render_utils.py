@@ -11,6 +11,45 @@ from utils.flow_utils import flow_to_image
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def depth2pts_outside(ray_o, ray_d, depth):
+    '''
+    ray_o, ray_d: [..., 3]
+    depth: [...]; inverse of distance to sphere origin
+    '''
+    print("start depth2pts_outside")
+    print("ray_o: ", ray_o[:5])
+    print("ray_d: ", ray_d[:5])
+    print("depth: ", depth[:5])
+    # note: d1 becomes negative if this mid point is behind camera
+    d1 = -torch.sum(ray_d * ray_o, dim=-1) / torch.sum(ray_d * ray_d, dim=-1)
+    p_mid = ray_o + d1.unsqueeze(-1) * ray_d
+    p_mid_norm = torch.norm(p_mid, dim=-1)
+    ray_d_cos = 1. / torch.norm(ray_d, dim=-1)
+    d2 = torch.sqrt(1. - p_mid_norm * p_mid_norm) * ray_d_cos
+    p_sphere = ray_o + (d1 + d2).unsqueeze(-1) * ray_d
+
+    rot_axis = torch.cross(ray_o, p_sphere, dim=-1)
+    rot_axis = rot_axis / torch.norm(rot_axis, dim=-1, keepdim=True)
+    phi = torch.asin(p_mid_norm)
+    theta = torch.asin(p_mid_norm * depth)  # depth is inside [0, 1]
+    rot_angle = (phi - theta).unsqueeze(-1)     # [..., 1]
+
+    # now rotate p_sphere
+    # Rodrigues formula: https://en.wikipedia.org/wiki/Rodrigues%27_rotation_formula
+    p_sphere_new = p_sphere * torch.cos(rot_angle) + \
+                   torch.cross(rot_axis, p_sphere, dim=-1) * torch.sin(rot_angle) + \
+                   rot_axis * torch.sum(rot_axis*p_sphere, dim=-1, keepdim=True) * (1.-torch.cos(rot_angle))
+    p_sphere_new = p_sphere_new / torch.norm(p_sphere_new, dim=-1, keepdim=True)
+    pts = torch.cat((p_sphere_new, depth.unsqueeze(-1)), dim=-1)
+
+    # now calculate conventional depth
+    depth_real = 1. / (depth + 1e-6) * torch.cos(theta) * ray_d_cos + d1
+    print("pts: ", pts[:5])
+    print("depth_real: ", depth_real[:5])
+    print("end depth2pts_outside")
+    return pts, depth_real
+
+
 def batchify_rays(t, chain_5frames,
                 rays_flat, chunk=1024*16, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
@@ -322,6 +361,7 @@ def render_path(render_poses,
 def raw2outputs(raw_s,
                 raw_d,
                 blending,
+                bg_z_vals,
                 z_vals,
                 rays_d,
                 raw_noise_std):
@@ -352,14 +392,26 @@ def raw2outputs(raw_s,
     dists = torch.cat(
         [dists, torch.Tensor([1e10]).expand(dists[..., :1].shape)],
          -1) # [N_rays, N_samples]
+    # print("dists: ", dists.shape)
+    # print(dists)
 
     # Multiply each distance by the norm of its corresponding direction ray
     # to convert to real world distance (accounts for non-unit directions).
     dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
 
+    bg_dists = bg_z_vals[..., :-1] - bg_z_vals[..., 1:]
+    # bg_dists = torch.cat((bg_dists, 1e10 * torch.ones_like(bg_dists[..., 0:1])), dim=-1)  # [..., N_samples]
+    bg_dists = torch.cat(
+        [bg_dists, torch.Tensor([1e10]).expand(bg_dists[..., :1].shape)],
+         -1) # [N_rays, N_samples]
+    # print("bg_dists: ", bg_dists.shape)
+    # print(bg_dists)
+
     # Extract RGB of each sample position along each ray.
     rgb_d = torch.sigmoid(raw_d[..., :3])  # [N_rays, N_samples, 3]
     rgb_s = torch.sigmoid(raw_s[..., :3])  # [N_rays, N_samples, 3]
+    print("full image rgb_s: ", rgb_s.shape)
+    print(rgb_s)
 
     # Add noise to model's predictions for density. Can be used to
     # regularize network during training (prevents floater artifacts).
@@ -370,7 +422,8 @@ def raw2outputs(raw_s,
     # Predict density of each sample along each ray. Higher values imply
     # higher likelihood of being absorbed at this point.
     alpha_d = raw2alpha(raw_d[..., 3] + noise, dists) # [N_rays, N_samples]
-    alpha_s = raw2alpha(raw_s[..., 3] + noise, dists) # [N_rays, N_samples]
+    alpha_s = raw2alpha(raw_s[..., 3] + noise, bg_dists) # [N_rays, N_samples]
+    # alpha_s = 1. - torch.exp(-raw_s[..., 3] * bg_dists)  # [..., N_samples]
     alphas  = 1. - (1. - alpha_s) * (1. - alpha_d) # [N_rays, N_samples]
 
     T_d    = torch.cumprod(torch.cat([torch.ones((alpha_d.shape[0], 1)), 1. - alpha_d + 1e-10], -1), -1)[:, :-1]
@@ -434,9 +487,13 @@ def raw2outputs_d(raw_d,
     # Multiply each distance by the norm of its corresponding direction ray
     # to convert to real world distance (accounts for non-unit directions).
     dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
+    # print("dists: ", dists.shape)
+    # print(dists)
 
     # Extract RGB of each sample position along each ray.
     rgb_d = torch.sigmoid(raw_d[..., :3])  # [N_rays, N_samples, 3]
+    # print("batch rgb_s: ", rgb_d.shape)
+    # print(rgb_d)
 
     # Add noise to model's predictions for density. Can be used to
     # regularize network during training (prevents floater artifacts).
@@ -537,6 +594,11 @@ def render_rays(t,
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
     z_vals = z_vals.expand([N_rays, N_samples])
 
+    # Static model, use sampling in NeRF++
+    dots_sh = list(rays_d.shape[:-1])  # number of rays
+    assert torch.equal(t_vals, torch.linspace(0., 1., N_samples))
+    bg_depth = t_vals.view([1, ] * len(dots_sh) + [N_samples,]).expand(dots_sh + [N_samples,]).to(device)
+    
     # Perturb sampling time along each ray.
     if perturb > 0.:
         # get intervals between samples
@@ -546,20 +608,27 @@ def render_rays(t,
         # stratified samples in those intervals
         t_rand = torch.rand(z_vals.shape)
         z_vals = lower + (upper - lower) * t_rand
-
+    
+        # get intervals between samples
+        mids = .5 * (bg_depth[..., 1:] + bg_depth[..., :-1])
+        upper = torch.cat([mids, bg_depth[..., -1:]], -1)
+        lower = torch.cat([bg_depth[..., :1], mids], -1)
+        # stratified samples in those intervals
+        t_rand = torch.rand(bg_depth.shape)
+        bg_depth = lower + (upper - lower) * t_rand
+    
+    # print("bg_depth: ", bg_depth.shape)
+    # print(bg_depth)
+    
+    # Dynamic model
     # Points in space to evaluate model at.
     pts = rays_o[..., None, :] + rays_d[..., None, :] * \
         z_vals[..., :, None] # [N_rays, N_samples, 3]
+    # print("pts: ", pts.shape)
+    # print(pts)
 
     # Add the time dimension to xyz.
     pts_ref = torch.cat([pts, torch.ones_like(pts[..., 0:1]) * t], -1)
-
-    # First pass: we have the staticNeRF results
-    raw_s = network_query_fn_s(pts_ref[..., :3], viewdirs, network_fn_s)
-    # raw_s:          [N_rays, N_samples, 5]
-    # raw_s_rgb:      [N_rays, N_samples, 0:3]
-    # raw_s_a:        [N_rays, N_samples, 3:4]
-    # raw_s_blending: [N_rays, N_samples, 4:5]
 
     # Second pass: we have the DyanmicNeRF results and the blending weight
     raw_d = network_query_fn_d(pts_ref, viewdirs, network_fn_d)
@@ -570,9 +639,30 @@ def render_rays(t,
     # sceneflow_f:    [N_rays, N_samples, 7:10]
     # raw_d_blending: [N_rays, N_samples, 10:11]
 
+    # print("rays_o: ", rays_o.shape)
+    # print(rays_o)
+    # print("rays_d: ", rays_d.shape)
+    # print(rays_d)
+    bg_ray_o = rays_o.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
+    bg_ray_d = rays_d.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
+    bg_pts, bg_depth_real = depth2pts_outside(bg_ray_o, bg_ray_d, bg_depth)  # [..., N_samples, 4]
+    bg_pts = torch.flip(bg_pts, dims=[-2])
+    bg_depth = torch.flip(bg_depth, dims=[-1])
+    # print("bg_pts: ", bg_pts.shape)
+    # print(torch.norm(bg_pts[:, :, :3], dim=-1), bg_pts[:, :, 3])
+    # print(bg_pts)
+
+    # First pass: we have the staticNeRF results
+    raw_s = network_query_fn_s(bg_pts, viewdirs, network_fn_s)
+    # raw_s:          [N_rays, N_samples, 5]
+    # raw_s_rgb:      [N_rays, N_samples, 0:3]
+    # raw_s_a:        [N_rays, N_samples, 3:4]
+    # raw_s_blending: [N_rays, N_samples, 4:5]
+
     if pretrain:
+        # print("------------pretrain------------")
         rgb_map_s, _ = raw2outputs_d(raw_s[..., :4],
-                                     z_vals,
+                                     bg_depth,#  z_vals,
                                      rays_d,
                                      raw_noise_std)
         ret = {'rgb_map_s': rgb_map_s}
@@ -602,6 +692,7 @@ def render_rays(t,
                                   raw_d_rgba,
                                   blending,
                                   z_vals,
+                                  bg_depth,
                                   rays_d,
                                   raw_noise_std)
 
